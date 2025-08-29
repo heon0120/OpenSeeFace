@@ -397,7 +397,8 @@ class FaceInfo():
 
         return pts_3d
 
-    def adjust_3d(self):
+
+    def adjust_3d(self, depth_frame=None):
         if self.conf < 0.4 or self.pnp_error > 300:
             return
 
@@ -408,8 +409,27 @@ class FaceInfo():
             update_type = -1
             d_o = np.ones((66,))
             d_c = np.ones((66,))
+            depth_weights = np.ones((66,))  # RealSense 깊이 가중치
+
+            # RealSense 깊이 데이터가 있을 때 가중치 계산
+            if depth_frame is not None:
+                try:
+                    for i in range(66):
+                        x, y = int(self.lms[i][0]), int(self.lms[i][1])
+                        if 0 <= x < depth_frame.get_width() and 0 <= y < depth_frame.get_height():
+                            actual_depth = depth_frame.get_distance(x, y)
+                            if actual_depth > 0.1 and actual_depth < 10.0:
+                                estimated_depth = abs(self.pts_3d[i][2])
+                                if estimated_depth > 0:
+                                    # 깊이 오차가 클수록 가중치 증가 (더 많은 조정 필요)
+                                    depth_error = abs(actual_depth - estimated_depth)
+                                    depth_weights[i] = min(2.0, 1.0 + depth_error / estimated_depth)
+                except Exception as e:
+                    if not self.tracker.silent:
+                        print(f"Depth weight calculation failed: {e}")
+
             for runs in range(max_runs):
-                r = 1.0 + np.random.random_sample((66,3)) * 0.02 - 0.01
+                r = 1.0 + np.random.random_sample((66, 3)) * 0.02 - 0.01
                 r[30, :] = 1.0
                 if self.euler[0] > -165 and self.euler[0] < 145:
                     continue
@@ -423,30 +443,74 @@ class FaceInfo():
                     # Enable only one side of the points, depending on direction
                     elif self.euler[1] < -10:
                         update_type = 1
-                        r[[0, 1, 2, 3, 4, 5, 6, 7, 17, 18, 19, 20, 21, 31, 32, 36, 37, 38, 39, 40, 41, 48, 49, 56, 57, 58, 59, 65], 2] = 1.0
-                        eligible = [8, 9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26, 27, 28, 29, 33, 34, 35, 42, 43, 44, 45, 46, 47, 50, 51, 52, 53, 54, 55, 60, 61, 62, 63, 64]
+                        r[[0, 1, 2, 3, 4, 5, 6, 7, 17, 18, 19, 20, 21, 31, 32, 36, 37, 38, 39, 40, 41, 48, 49, 56, 57, 58,
+                           59, 65], 2] = 1.0
+                        eligible = [8, 9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26, 27, 28, 29, 33, 34, 35, 42, 43,
+                                    44, 45, 46, 47, 50, 51, 52, 53, 54, 55, 60, 61, 62, 63, 64]
                     else:
                         update_type = 1
-                        r[[9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26, 34, 35, 42, 43, 44, 45, 46, 47, 51, 52, 53, 54, 61, 62, 63], 2] = 1.0
-                        eligible = [0, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21, 27, 28, 29, 31, 32, 33, 36, 37, 38, 39, 40, 41, 48, 49, 50, 55, 56, 57, 58, 59, 60, 64, 65]
+                        r[[9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24, 25, 26, 34, 35, 42, 43, 44, 45, 46, 47, 51, 52, 53,
+                           54, 61, 62, 63], 2] = 1.0
+                        eligible = [0, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21, 27, 28, 29, 31, 32, 33, 36, 37, 38, 39,
+                                    40, 41, 48, 49, 50, 55, 56, 57, 58, 59, 60, 64, 65]
 
                 if self.limit_3d_adjustment:
-                    eligible = np.nonzero(self.update_counts[:, update_type] < self.update_counts[:, abs(update_type - 1)] + self.update_count_delta)[0]
+                    eligible = np.nonzero(self.update_counts[:, update_type] < self.update_counts[:,
+                                                                               abs(update_type - 1)] + self.update_count_delta)[
+                        0]
                     if eligible.shape[0] <= 0:
                         break
 
                 if runs == 0:
                     updated = copy.copy(self.face_3d[0:66])
-                    o_projected = np.ones((66,2))
-                    o_projected[eligible] = np.squeeze(np.array(cv2.projectPoints(self.face_3d[eligible], self.rotation, self.translation, self.tracker.camera, self.tracker.dist_coeffs)[0]), 1)
+                    o_projected = np.ones((66, 2))
+                    o_projected[eligible] = np.squeeze(np.array(
+                        cv2.projectPoints(self.face_3d[eligible], self.rotation, self.translation, self.tracker.camera,
+                                          self.tracker.dist_coeffs)[0]), 1)
                 c = updated * r
-                c_projected = np.zeros((66,2))
-                c_projected[eligible] = np.squeeze(np.array(cv2.projectPoints(c[eligible], self.rotation, self.translation, self.tracker.camera, self.tracker.dist_coeffs)[0]), 1)
+                c_projected = np.zeros((66, 2))
+                c_projected[eligible] = np.squeeze(np.array(
+                    cv2.projectPoints(c[eligible], self.rotation, self.translation, self.tracker.camera,
+                                      self.tracker.dist_coeffs)[0]), 1)
                 changed = False
 
                 d_o[eligible] = np.linalg.norm(o_projected[eligible] - self.lms[eligible, 0:2], axis=1)
                 d_c[eligible] = np.linalg.norm(c_projected[eligible] - self.lms[eligible, 0:2], axis=1)
-                indices = np.nonzero(d_c < d_o)[0]
+
+                # RealSense 깊이 데이터가 있을 때 깊이 오차도 고려
+                if depth_frame is not None:
+                    try:
+                        depth_error_o = np.zeros(66)
+                        depth_error_c = np.zeros(66)
+
+                        for i in eligible:
+                            x, y = int(self.lms[i][0]), int(self.lms[i][1])
+                            if 0 <= x < depth_frame.get_width() and 0 <= y < depth_frame.get_height():
+                                actual_depth = depth_frame.get_distance(x, y)
+                                if actual_depth > 0.1 and actual_depth < 10.0:
+                                    # 원본과 후보 모델의 깊이 오차 계산
+                                    orig_depth = abs(self.face_3d[i][2])
+                                    cand_depth = abs(c[i][2])
+
+                                    depth_error_o[i] = abs(actual_depth - orig_depth) * depth_weights[i]
+                                    depth_error_c[i] = abs(actual_depth - cand_depth) * depth_weights[i]
+
+                        # 2D 투영 오차와 깊이 오차를 결합 (깊이 오차에 가중치 적용)
+                        depth_weight_factor = 0.3  # 깊이 오차의 영향도 조절
+                        combined_error_o = d_o + depth_error_o * depth_weight_factor
+                        combined_error_c = d_c + depth_error_c * depth_weight_factor
+
+                        indices = np.nonzero(combined_error_c < combined_error_o)[0]
+
+                    except Exception as e:
+                        # 깊이 데이터 처리 중 오류 발생 시 기존 방식 사용
+                        indices = np.nonzero(d_c < d_o)[0]
+                        if not self.tracker.silent:
+                            print(f"Depth-enhanced 3D adjustment failed, using 2D only: {e}")
+                else:
+                    # RealSense가 없으면 기존 방식 사용
+                    indices = np.nonzero(d_c < d_o)[0]
+
                 if indices.shape[0] > 0:
                     if self.limit_3d_adjustment:
                         indices = np.intersect1d(indices, eligible)
@@ -461,15 +525,30 @@ class FaceInfo():
                     break
 
             if changed_any:
-                # Update weighted by point confidence
-                weights = np.zeros((66,3))
+                # Update weighted by point confidence and depth reliability
+                weights = np.zeros((66, 3))
                 weights[:, :] = self.lms[0:66, 2:3]
                 weights[weights > 0.7] = 1.0
                 weights = 1.0 - weights
+
+                # RealSense가 있을 때 깊이 신뢰도도 가중치에 반영
+                if depth_frame is not None:
+                    try:
+                        for i in range(66):
+                            x, y = int(self.lms[i][0]), int(self.lms[i][1])
+                            if 0 <= x < depth_frame.get_width() and 0 <= y < depth_frame.get_height():
+                                actual_depth = depth_frame.get_distance(x, y)
+                                if actual_depth > 0.1 and actual_depth < 10.0:
+                                    # 깊이 데이터가 신뢰할 만하면 가중치 조정
+                                    weights[i] *= 0.8  # 더 많은 업데이트 허용
+                    except Exception:
+                        pass
+
                 update_indices = np.arange(0, 66)
                 if self.limit_3d_adjustment:
                     update_indices = np.nonzero(self.update_counts[:, update_type] <= self.update_count_max)[0]
-                self.face_3d[update_indices] = self.face_3d[update_indices] * weights[update_indices] + updated[update_indices] * (1. - weights[update_indices])
+                self.face_3d[update_indices] = self.face_3d[update_indices] * weights[update_indices] + updated[
+                    update_indices] * (1. - weights[update_indices])
                 self.update_contour()
 
         self.pts_3d = self.normalize_pts3d(self.pts_3d)
@@ -667,7 +746,7 @@ class Tracker():
         self.wait_count = 0
         self.scan_every = scan_every
         self.bbox_growth = bbox_growth
-        self.silent = silent
+        self.silent = False
         self.try_hard = try_hard
 
         self.res = 224.
@@ -761,23 +840,62 @@ class Tracker():
                 avg_conf = part_avg
         return (avg_conf, np.array(lms))
 
-    def estimate_depth(self, face_info):
-        lms = np.concatenate((face_info.lms, np.array([[face_info.eye_state[0][1], face_info.eye_state[0][2], face_info.eye_state[0][3]], [face_info.eye_state[1][1], face_info.eye_state[1][2], face_info.eye_state[1][3]]], np.float32)), 0)
+    def estimate_depth(self, face_info, depth_frame=None):
+        lms = np.concatenate((face_info.lms, np.array(
+            [[face_info.eye_state[0][1], face_info.eye_state[0][2], face_info.eye_state[0][3]],
+             [face_info.eye_state[1][1], face_info.eye_state[1][2], face_info.eye_state[1][3]]], np.float32)), 0)
 
         image_pts = np.array(lms)[face_info.contour_pts, 0:2]
 
         success = False
         if face_info.rotation is not None:
-            success, face_info.rotation, face_info.translation = cv2.solvePnP(face_info.contour, image_pts, self.camera, self.dist_coeffs, useExtrinsicGuess=True, rvec=np.transpose(face_info.rotation), tvec=np.transpose(face_info.translation), flags=cv2.SOLVEPNP_ITERATIVE)
+            success, face_info.rotation, face_info.translation = cv2.solvePnP(face_info.contour, image_pts, self.camera,
+                                                                              self.dist_coeffs, useExtrinsicGuess=True,
+                                                                              rvec=np.transpose(face_info.rotation),
+                                                                              tvec=np.transpose(face_info.translation),
+                                                                              flags=cv2.SOLVEPNP_ITERATIVE)
         else:
             rvec = np.array([0, 0, 0], np.float32)
             tvec = np.array([0, 0, 0], np.float32)
-            success, face_info.rotation, face_info.translation = cv2.solvePnP(face_info.contour, image_pts, self.camera, self.dist_coeffs, useExtrinsicGuess=True, rvec=rvec, tvec=tvec, flags=cv2.SOLVEPNP_ITERATIVE)
+            success, face_info.rotation, face_info.translation = cv2.solvePnP(face_info.contour, image_pts, self.camera,
+                                                                              self.dist_coeffs, useExtrinsicGuess=True,
+                                                                              rvec=rvec, tvec=tvec,
+                                                                              flags=cv2.SOLVEPNP_ITERATIVE)
 
         rotation = face_info.rotation
         translation = face_info.translation
 
-        pts_3d = np.zeros((70,3), np.float32)
+        # RealSense 깊이 데이터가 있을 때 거리 보정 적용
+        if depth_frame is not None and success:
+            try:
+                # 코 끝점 (인덱스 30)의 실제 깊이 측정
+                nose_x, nose_y = int(lms[30][0]), int(lms[30][1])
+
+                # 이미지 경계 확인
+                if 0 <= nose_x < depth_frame.get_width() and 0 <= nose_y < depth_frame.get_height():
+                    actual_depth = depth_frame.get_distance(nose_x, nose_y)
+
+                    if actual_depth > 0.1 and actual_depth < 10.0:  # 유효한 깊이 범위 (0.1m ~ 10m)
+                        # Translation vector의 Z값을 실제 깊이로 보정
+                        depth_scale = actual_depth / (translation[2][0] if translation[2][0] != 0 else 1.0)
+
+                        # 급격한 변화를 방지하기 위한 스무딩
+                        if hasattr(face_info, 'prev_depth_scale') and face_info.prev_depth_scale is not None:
+                            alpha = 0.7  # 스무딩 팩터
+                            depth_scale = alpha * face_info.prev_depth_scale + (1 - alpha) * depth_scale
+
+                        face_info.prev_depth_scale = depth_scale
+
+                        # Translation vector 조정
+                        translation = translation * depth_scale
+                        face_info.translation = translation
+
+            except Exception as e:
+                # 깊이 데이터 처리 중 오류 발생 시 기존 방식 유지
+                if not self.silent:
+                    print(f"RealSense depth correction failed: {e}")
+
+        pts_3d = np.zeros((70, 3), np.float32)
         if not success:
             face_info.rotation = np.array([0.0, 0.0, 0.0], np.float32)
             face_info.translation = np.array([0.0, 0.0, 0.0], np.float32)
@@ -793,12 +911,13 @@ class Tracker():
         t_reference = t_reference.dot(self.camera.transpose())
         t_depth = t_reference[:, 2]
         t_depth[t_depth == 0] = 0.000001
-        t_depth_e = np.expand_dims(t_depth[:],1)
+        t_depth_e = np.expand_dims(t_depth[:], 1)
         t_reference = t_reference[:] / t_depth_e
-        pts_3d[0:66] = np.stack([lms[0:66,0], lms[0:66,1], np.ones((66,))], 1) * t_depth_e[0:66]
-        pts_3d[0:66] = (pts_3d[0:66].dot(self.inverse_camera.transpose()) - face_info.translation).dot(inverse_rotation.transpose())
-        pnp_error = np.power(lms[0:17,0:2] - t_reference[0:17,0:2], 2).sum()
-        pnp_error += np.power(lms[30,0:2] - t_reference[30,0:2], 2).sum()
+        pts_3d[0:66] = np.stack([lms[0:66, 0], lms[0:66, 1], np.ones((66,))], 1) * t_depth_e[0:66]
+        pts_3d[0:66] = (pts_3d[0:66].dot(self.inverse_camera.transpose()) - face_info.translation).dot(
+            inverse_rotation.transpose())
+        pnp_error = np.power(lms[0:17, 0:2] - t_reference[0:17, 0:2], 2).sum()
+        pnp_error += np.power(lms[30, 0:2] - t_reference[30, 0:2], 2).sum()
         if np.isnan(pnp_error):
             pnp_error = 9999999.
         for i, pt in enumerate(face_info.face_3d[66:70]):
@@ -820,13 +939,13 @@ class Tracker():
                 pts_3d[69] = pt_3d
                 continue
             if i == 0:
-                d1 = np.linalg.norm(lms[66,0:2] - lms[36,0:2])
-                d2 = np.linalg.norm(lms[66,0:2] - lms[39,0:2])
+                d1 = np.linalg.norm(lms[66, 0:2] - lms[36, 0:2])
+                d2 = np.linalg.norm(lms[67, 0:2] - lms[39, 0:2])
                 d = d1 + d2
                 pt = (pts_3d[36] * d1 + pts_3d[39] * d2) / d
             if i == 1:
-                d1 = np.linalg.norm(lms[67,0:2] - lms[42,0:2])
-                d2 = np.linalg.norm(lms[67,0:2] - lms[45,0:2])
+                d1 = np.linalg.norm(lms[67, 0:2] - lms[42, 0:2])
+                d2 = np.linalg.norm(lms[67, 0:2] - lms[45, 0:2])
                 d = d1 + d2
                 pt = (pts_3d[42] * d1 + pts_3d[45] * d2) / d
             if i < 2:
@@ -834,12 +953,12 @@ class Tracker():
                 reference = reference + face_info.translation
                 reference = self.camera.dot(reference)
                 depth = reference[2]
-                pt_3d = np.array([lms[66+i][0] * depth, lms[66+i][1] * depth, depth], np.float32)
+                pt_3d = np.array([lms[66 + i][0] * depth, lms[66 + i][1] * depth, depth], np.float32)
                 pt_3d = self.inverse_camera.dot(pt_3d)
                 pt_3d = pt_3d - face_info.translation
                 pt_3d = inverse_rotation.dot(pt_3d)
-                pts_3d[66+i,:] = pt_3d[:]
-        pts_3d[np.isnan(pts_3d).any(axis=1)] = np.array([0.,0.,0.], dtype=np.float32)
+                pts_3d[66 + i, :] = pt_3d[:]
+        pts_3d[np.isnan(pts_3d).any(axis=1)] = np.array([0., 0., 0.], dtype=np.float32)
 
         pnp_error = np.sqrt(pnp_error / (2.0 * image_pts.shape[0]))
         if pnp_error > 300:
@@ -851,13 +970,14 @@ class Tracker():
                 face_info.face_3d = copy.copy(self.face_3d)
                 face_info.rotation = None
                 face_info.translation = np.array([0.0, 0.0, 0.0], np.float32)
-                face_info.update_counts = np.zeros((66,2))
+                face_info.update_counts = np.zeros((66, 2))
                 face_info.update_contour()
         else:
             face_info.fail_count = 0
 
         euler = cv2.RQDecomp3x3(rmat)[0]
         return True, matrix_to_quaternion(rmat), euler, pnp_error, pts_3d, lms
+    
 
     def preprocess(self, im, crop):
         x1, y1, x2, y2 = crop

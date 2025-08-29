@@ -47,6 +47,8 @@ parser.add_argument("--face-id-offset", type=int, help="When set, this offset is
 parser.add_argument("--repeat-video", type=int, help="When set to 1 and a video file was specified with -c, the tracker will loop the video until interrupted", default=0)
 parser.add_argument("--dump-points", type=str, help="When set to a filename, the current face 3D points are made symmetric and dumped to the given file when quitting the visualization with the \"q\" key", default="")
 parser.add_argument("--benchmark", type=int, help="When set to 1, the different tracking models are benchmarked, starting with the best and ending with the fastest and with gaze tracking disabled for models with negative IDs", default=0)
+parser.add_argument("--realsense", type=int, help="When set to 1, uses pyrealsense2 for camera input", default=0)
+
 if os.name == 'nt':
     parser.add_argument("--use-dshowcapture", type=int, help="When set to 1, libdshowcapture will be used for video input instead of OpenCV", default=1)
     parser.add_argument("--blackmagic-options", type=str, help="When set, this additional option string is passed to the blackmagic capture library", default=None)
@@ -159,11 +161,31 @@ use_dshowcapture_flag = False
 if os.name == 'nt':
     dcap = args.dcap
     use_dshowcapture_flag = True if args.use_dshowcapture == 1 else False
-    input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
+
+    input_reader = InputReader(
+        args.capture,
+        args.raw_rgb,
+        args.width,
+        args.height,
+        fps,
+        use_dshowcapture=(args.use_dshowcapture == 1) if os.name == 'nt' else False,
+        dcap=args.dcap if os.name == 'nt' else None,
+        use_realsense=(args.realsense == 1)
+    )
+
     if args.dcap == -1 and type(input_reader) == DShowCaptureReader:
         fps = min(fps, input_reader.device.get_fps())
 else:
-    input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps)
+    input_reader = InputReader(
+        args.capture,
+        args.raw_rgb,
+        args.width,
+        args.height,
+        fps,
+        use_dshowcapture=(args.use_dshowcapture == 1) if os.name == 'nt' else False,
+        dcap=args.dcap if os.name == 'nt' else None,
+        use_realsense=(args.realsense == 1)
+    )
 if type(input_reader.reader) == VideoReader:
     fps = 0
 
@@ -205,9 +227,29 @@ try:
     need_reinit = 0
     failures = 0
     source_name = input_reader.name
+    
+    # 디버그 정보를 저장할 변수들
+    debug_info = {
+        'inference_time': 0,
+        'faces_count': 0,
+        'frame_info': '',
+        'tracking_status': 'No faces detected',
+        'data_sent': False
+    }
+    
     while repeat or input_reader.is_open():
         if not input_reader.is_open() or need_reinit == 1:
-            input_reader = InputReader(args.capture, args.raw_rgb, args.width, args.height, fps, use_dshowcapture=use_dshowcapture_flag, dcap=dcap)
+            input_reader = InputReader(
+                args.capture,
+                args.raw_rgb,
+                args.width,
+                args.height,
+                fps,
+                use_dshowcapture=(args.use_dshowcapture == 1) if os.name == 'nt' else False,
+                dcap=args.dcap if os.name == 'nt' else None,
+                use_realsense=(args.realsense == 1)
+            )
+
             if input_reader.name != source_name:
                 print(f"Failed to reinitialize camera and got {input_reader.name} instead of {source_name}.")
                 sys.exit(1)
@@ -250,17 +292,32 @@ try:
             tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
             if args.video_out is not None:
                 out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
-
+        
         try:
             inference_start = time.perf_counter()
             faces = tracker.predict(frame)
+            inference_time = (time.perf_counter() - inference_start)
+
+            # 디버그 정보 업데이트
+            debug_info['inference_time'] = inference_time * 1000  # ms로 변환
+            debug_info['faces_count'] = len(faces)
+            
             if len(faces) > 0:
-                inference_time = (time.perf_counter() - inference_start)
                 total_tracking_time += inference_time
                 tracking_time += inference_time / len(faces)
                 tracking_frames += 1
+                debug_info['tracking_status'] = f"Tracking {len(faces)} face(s)"
+            else:
+                debug_info['tracking_status'] = "No faces detected"
+
+            # 프레임 정보 업데이트 (30프레임마다)
+            if frame_count % 30 == 0:
+                debug_info['frame_info'] = f"Frame {frame_count}: {frame.shape} {frame.dtype} Min:{frame.min()} Max:{frame.max()}"
+
             packet = bytearray()
             detected = False
+            face_details = []  # 각 얼굴의 세부 정보를 저장
+            
             for face_num, f in enumerate(faces):
                 f = copy.copy(f)
                 f.id += args.face_id_offset
@@ -268,9 +325,18 @@ try:
                     f.eye_blink = [1, 1]
                 right_state = "O" if f.eye_blink[0] > 0.30 else "-"
                 left_state = "O" if f.eye_blink[1] > 0.30 else "-"
-                if args.silent == 0:
-                    print(f"Confidence[{f.id}]: {f.conf:.4f} / 3D fitting error: {f.pnp_error:.4f} / Eyes: {left_state}, {right_state}")
+                
+                # 얼굴 정보를 리스트에 저장 (화면에 표시용)
+                face_details.append({
+                    'id': f.id,
+                    'conf': f.conf,
+                    'pnp_error': f.pnp_error,
+                    'left_eye': left_state,
+                    'right_eye': right_state
+                })
+                
                 detected = True
+
                 if not f.success:
                     pts_3d = np.zeros((70, 3), np.float32)
                 packet.extend(bytearray(struct.pack("d", now)))
@@ -292,14 +358,17 @@ try:
                 packet.extend(bytearray(struct.pack("f", f.translation[1])))
                 packet.extend(bytearray(struct.pack("f", f.translation[2])))
                 if log is not None:
-                    log.write(f"{frame_count},{now},{width},{height},{fps},{face_num},{f.id},{f.eye_blink[0]},{f.eye_blink[1]},{f.conf},{f.success},{f.pnp_error},{f.quaternion[0]},{f.quaternion[1]},{f.quaternion[2]},{f.quaternion[3]},{f.euler[0]},{f.euler[1]},{f.euler[2]},{f.rotation[0]},{f.rotation[1]},{f.rotation[2]},{f.translation[0]},{f.translation[1]},{f.translation[2]}")
-                for (x,y,c) in f.lms:
+                    log.write(
+                        f"{frame_count},{now},{width},{height},{fps},{face_num},{f.id},{f.eye_blink[0]},{f.eye_blink[1]},{f.conf},{f.success},{f.pnp_error},{f.quaternion[0]},{f.quaternion[1]},{f.quaternion[2]},{f.quaternion[3]},{f.euler[0]},{f.euler[1]},{f.euler[2]},{f.rotation[0]},{f.rotation[1]},{f.rotation[2]},{f.translation[0]},{f.translation[1]},{f.translation[2]}")
+                for (x, y, c) in f.lms:
                     packet.extend(bytearray(struct.pack("f", c)))
                 if args.visualize > 1:
-                    frame = cv2.putText(frame, str(f.id), (int(f.bbox[0]), int(f.bbox[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,0,255))
+                    frame = cv2.putText(frame, str(f.id), (int(f.bbox[0]), int(f.bbox[1])), cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.75, (255, 0, 255))
                 if args.visualize > 2:
-                    frame = cv2.putText(frame, f"{f.conf:.4f}", (int(f.bbox[0] + 18), int(f.bbox[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255))
-                for pt_num, (x,y,c) in enumerate(f.lms):
+                    frame = cv2.putText(frame, f"{f.conf:.4f}", (int(f.bbox[0] + 18), int(f.bbox[1] - 6)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255))
+                for pt_num, (x, y, c) in enumerate(f.lms):
                     packet.extend(bytearray(struct.pack("f", y)))
                     packet.extend(bytearray(struct.pack("f", x)))
                     if log is not None:
@@ -312,7 +381,8 @@ try:
                     y = int(y + 0.5)
                     if args.visualize != 0 or out is not None:
                         if args.visualize > 3:
-                            frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255,255,0))
+                            frame = cv2.putText(frame, str(pt_num), (int(y), int(x)), cv2.FONT_HERSHEY_SIMPLEX, 0.25,
+                                                (255, 255, 0))
                         color = (0, 255, 0)
                         if pt_num >= 66:
                             color = (255, 255, 0)
@@ -320,10 +390,12 @@ try:
                             cv2.circle(frame, (y, x), 1, color, -1)
                 if args.pnp_points != 0 and (args.visualize != 0 or out is not None) and f.rotation is not None:
                     if args.pnp_points > 1:
-                        projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
+                        projected = cv2.projectPoints(f.face_3d[0:66], f.rotation, f.translation, tracker.camera,
+                                                      tracker.dist_coeffs)
                     else:
-                        projected = cv2.projectPoints(f.contour, f.rotation, f.translation, tracker.camera, tracker.dist_coeffs)
-                    for [(x,y)] in projected[0]:
+                        projected = cv2.projectPoints(f.contour, f.rotation, f.translation, tracker.camera,
+                                                      tracker.dist_coeffs)
+                    for [(x, y)] in projected[0]:
                         x = int(x + 0.5)
                         y = int(y + 0.5)
                         if not (x < 0 or y < 0 or x >= height or y >= width):
@@ -337,7 +409,7 @@ try:
                         x -= 1
                         if not (x < 0 or y < 0 or x >= height or y >= width):
                             frame[int(x), int(y)] = (0, 255, 255)
-                for (x,y,z) in f.pts_3d:
+                for (x, y, z) in f.pts_3d:
                     packet.extend(bytearray(struct.pack("f", x)))
                     packet.extend(bytearray(struct.pack("f", -y)))
                     packet.extend(bytearray(struct.pack("f", -z)))
@@ -355,13 +427,33 @@ try:
                     log.write("\r\n")
                     log.flush()
 
+            # 데이터 전송 상태 업데이트
             if detected and len(faces) < 40:
                 sock.sendto(packet, (target_ip, target_port))
+                debug_info['data_sent'] = True
+            else:
+                debug_info['data_sent'] = False
+
+            # OpenCV 창에 간단한 디버그 정보 표시 (args.visualize != 0일 때만)
+            if args.visualize != 0:
+                y_pos = 20
+                line_height = 18
+                
+                # 기본 정보를 한 줄로 압축
+                main_info = f"Inference:{debug_info['inference_time']:.1f}ms | {debug_info['tracking_status']} | Data:{'OK' if debug_info['data_sent'] else 'NO'} | Frame:{frame_count}"
+                cv2.putText(frame, main_info, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                
+                # 얼굴별 정보를 간단하게 표시
+                for i, face_info in enumerate(face_details):
+                    face_text = f"F{face_info['id']}:C{face_info['conf']:.2f} E{face_info['pnp_error']:.2f} [{face_info['left_eye']}{face_info['right_eye']}]"
+                    cv2.putText(frame, face_text, (10, y_pos + (i + 1) * line_height), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
 
             if out is not None:
                 video_frame = frame
                 if args.video_scale != 1:
-                    video_frame = cv2.resize(frame, (width * args.video_scale, height * args.video_scale), interpolation=cv2.INTER_NEAREST)
+                    video_frame = cv2.resize(frame, (width * args.video_scale, height * args.video_scale),
+                                             interpolation=cv2.INTER_NEAREST)
                 out.write(video_frame)
                 if args.video_scale != 1:
                     del video_frame
@@ -369,51 +461,6 @@ try:
             if args.visualize != 0:
                 cv2.imshow('OpenSeeFace Visualization', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    if args.dump_points != "" and faces is not None and len(faces) > 0:
-                        np.set_printoptions(threshold=sys.maxsize, precision=15)
-                        pairs = [
-                            (0, 16),
-                            (1, 15),
-                            (2, 14),
-                            (3, 13),
-                            (4, 12),
-                            (5, 11),
-                            (6, 10),
-                            (7, 9),
-                            (17, 26),
-                            (18, 25),
-                            (19, 24),
-                            (20, 23),
-                            (21, 22),
-                            (31, 35),
-                            (32, 34),
-                            (36, 45),
-                            (37, 44),
-                            (38, 43),
-                            (39, 42),
-                            (40, 47),
-                            (41, 46),
-                            (48, 52),
-                            (49, 51),
-                            (56, 54),
-                            (57, 53),
-                            (58, 62),
-                            (59, 61),
-                            (65, 63)
-                        ]
-                        points = copy.copy(faces[0].face_3d)
-                        for a, b in pairs:
-                            x = (points[a, 0] - points[b, 0]) / 2.0
-                            y = (points[a, 1] + points[b, 1]) / 2.0
-                            z = (points[a, 2] + points[b, 2]) / 2.0
-                            points[a, 0] = x
-                            points[b, 0] = -x
-                            points[[a, b], 1] = y
-                            points[[a, b], 2] = z
-                        points[[8, 27, 28, 29, 33, 50, 55, 60, 64], 0] = 0.0
-                        points[30, :] = 0.0
-                        with open(args.dump_points, "w") as fh:
-                            fh.write(repr(points))
                     break
             failures = 0
         except Exception as e:
@@ -421,7 +468,9 @@ try:
                 if args.silent == 0:
                     print("Quitting")
                 break
-            traceback.print_exc()
+            # 예외 발생 시에도 화면에 표시
+            if args.visualize != 0:
+                cv2.putText(frame, f"Error: {str(e)[:50]}...", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             failures += 1
             if failures > 30:
                 break

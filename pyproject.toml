@@ -11,6 +11,7 @@ numpy = "^1.21.3"
 opencv-python = "^4.5.4"
 Pillow = "^8.4.0"
 onnxruntime = "^1.9.0"
+pyrealsense2 = "^2.56.5"
 
 [tool.poetry.dev-dependencies]
 
